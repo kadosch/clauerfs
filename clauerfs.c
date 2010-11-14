@@ -25,6 +25,7 @@
 #include "blocktypes.h"
 #include "UtilBloques.h"
 #include "uthash.h"
+#include "CRYPTOWrap.h"
 
 struct i_clauer_handle {
   char device[MAX_DEVICE_LEN];   /* The device path (eg. "/dev/sda4") */
@@ -39,53 +40,50 @@ i_clauer_handle_t handle;
 
 struct file_map{
 	char file_name[35];
-	int file_block_pos;
+	int cert_block_pos;
+	int key_block_pos;
 	UT_hash_handle hh;
 };
 typedef struct file_map file_map_t;
 
 file_map_t *fm = NULL;
+char * pwd = "h0l4c4r4c0l4";
 
 int rellenar_hash(){
-	int i;
-	block_object_t data_block;
-	char name[35], friendly[15];
-	file_map_t *filemap, *filemap_new;
+	int i, j, tam;
+	block_object_t data_block, data_block2, deciphered_block;
+	char name[35];
+	file_map_t *filemap_new;
 	
 	for (i=0; i < handle.ib.cb; ++i){
 		if (lseek(handle.hDevice, ((i+1)*BLOCK_SIZE)+(handle.ib.rzSize*BLOCK_SIZE), SEEK_SET) == -1)
 			return errno;
 		if (read(handle.hDevice, (void *) &data_block, BLOCK_SIZE) == -1)
 			return errno;
-		if (data_block.mode == MODO_CLARO && data_block.type != BLOQUE_KEY_CONTAINERS){
-			switch (data_block.type){
-				case BLOQUE_CERT_PROPIO:
-					sprintf(friendly,"%s",BLOQUE_CERTPROPIO_Get_FriendlyName((unsigned char *) &data_block));
-					break;
-				case BLOQUE_CERT_RAIZ:
-					sprintf(friendly,"%s",BLOQUE_CERTRAIZ_Get_FriendlyName((unsigned char *) &data_block));
-					break;
-				case BLOQUE_CERT_INTERMEDIO:
-					sprintf(friendly,"%s", BLOQUE_CERTINTERMEDIO_Get_FriendlyName((unsigned char *) &data_block));
-					break;
-				case BLOQUE_CERT_OTROS:
-					sprintf(friendly,"%s", BLOQUE_CERTOTROS_Get_FriendlyName((unsigned char *) &data_block));
-					break;
-				default:
-					sprintf(friendly,"%s","");
-			}
-			if (strlen(friendly)>0)
-				sprintf(name,"%s_%s",BLOQUE_Tipo_Str((unsigned char *) &data_block),friendly);
-			else
-				sprintf(name,"%s",BLOQUE_Tipo_Str((unsigned char *) &data_block));
-			
-			HASH_FIND_STR(fm, name, filemap);
-			if (filemap){
-				sprintf(name,"%s_%s",name,"OTRO");
-			}
+		if (!BLOQUE_Es_Vacio((unsigned char *) &data_block) && data_block.type == BLOQUE_CERT_PROPIO){
+			sprintf(name,"%s",BLOQUE_CERTPROPIO_Get_FriendlyName((unsigned char *) &data_block));
 			filemap_new = (void *) malloc(sizeof(file_map_t));
-			filemap_new->file_block_pos = i;
+			filemap_new->cert_block_pos = i;
+			filemap_new->key_block_pos = -1;
 			strcpy(filemap_new->file_name,name);
+			for (j=0; j < handle.ib.cb; ++j){
+				if (lseek(handle.hDevice, ((j+1)*BLOCK_SIZE)+(handle.ib.rzSize*BLOCK_SIZE), SEEK_SET) == -1)
+					return errno;
+				if (read(handle.hDevice, (void *) &data_block2, BLOCK_SIZE) == -1)
+					return errno;
+				if (!BLOQUE_Es_Vacio((unsigned char *) &data_block2) && data_block2.type == BLOQUE_LLAVE_PRIVADA){
+					CRYPTO_PBE_Descifrar(pwd, handle.ib.id, 20, 1000, 1, CRYPTO_CIPHER_DES_EDE3_CBC, data_block2.info, BLOCK_SIZE-8, deciphered_block.info, &tam);
+					if (CRYPTO_X509_LLAVE(	BLOQUE_CERTPROPIO_Get_Objeto((unsigned char *) &data_block), 
+											BLOQUE_CERTPROPIO_Get_Tam((unsigned char *) &data_block),
+											BLOQUE_LLAVEPRIVADA_Get_Objeto((unsigned char *) &deciphered_block),
+											BLOQUE_LLAVEPRIVADA_Get_Tam((unsigned char *) &deciphered_block), 
+											pwd))
+					{
+						filemap_new->key_block_pos = j;
+						break;
+					}
+				}
+			}
 			HASH_ADD_STR(fm,file_name,filemap_new);
 		}
 	}
@@ -97,6 +95,7 @@ static int clauer_readdir(const char *path, void *buf, fuse_fill_dir_t filler, o
 	(void) offset;
 	(void) fi;
 	file_map_t *filemap;
+	char cert[40], key[40];	
     
 	if(strcmp(path, "/") != 0)
     	return -ENOENT;
@@ -105,7 +104,12 @@ static int clauer_readdir(const char *path, void *buf, fuse_fill_dir_t filler, o
 	filler(buf, "..", NULL, 0);
 	
 	for (filemap=fm; filemap!=NULL; filemap=filemap->hh.next){
-		filler(buf,filemap->file_name,NULL,0);
+		sprintf(cert, "%s.cert", filemap->file_name);
+		filler(buf,cert,NULL,0);
+		if (filemap->key_block_pos != -1){
+			sprintf(key, "%s.key", filemap->file_name);
+			filler(buf,key,NULL,0);
+		}
 	}
 	 
 	return 0;
@@ -113,61 +117,45 @@ static int clauer_readdir(const char *path, void *buf, fuse_fill_dir_t filler, o
 
 
 static int clauer_getattr(const char *path, struct stat *stbuf){
-	block_object_t data_block;
+	block_object_t data_block, deciphered_block;
 	file_map_t *filemap;
-	int res = 0, block_number;
+	int res = 0, block_number, tam;
+	char * name, *extension;
 	
+	name = strtok((char *) path+1,".");
+	extension = strtok(NULL,".");
+
 	memset(stbuf, 0, sizeof(struct stat));
 	if(strcmp(path, "/") == 0) {
 		stbuf->st_mode = S_IFDIR | 0555;
 		stbuf->st_nlink = 3;
 	}
 	else{
- 		HASH_FIND_STR(fm,path+1,filemap);
+ 		HASH_FIND_STR(fm,name,filemap);
  		if (filemap){
-			block_number = filemap->file_block_pos;
-			if (lseek(handle.hDevice, ((block_number+1)*BLOCK_SIZE)+(handle.ib.rzSize*BLOCK_SIZE), SEEK_SET) == -1)
-				return -errno;
-			if (read(handle.hDevice, &data_block, BLOCK_SIZE) == -1)
-				return -errno;
 			stbuf->st_mode = S_IFREG | 0444;
 			stbuf->st_nlink = 1;
-			switch (data_block.type){
-				case BLOQUE_LLAVE_PRIVADA:
-					//stbuf->st_size = BLOQUE_LLAVEPRIVADA_Get_Tam(data_block);
-					memcpy(&(stbuf->st_size), (data_block.info)+1,BYTES_TAMANYO);
-					break;
-				case BLOQUE_CERT_PROPIO:
-					//stbuf->st_size = BLOQUE_CERTPROPIO_Get_Tam(data_block);
-					memcpy(&(stbuf->st_size), data_block.info,BYTES_TAMANYO);
-					break;
-				case BLOQUE_CERT_RAIZ:
-					//stbuf->st_size = BLOQUE_CERTRAIZ_Get_Tam(data_block);
-					memcpy(&(stbuf->st_size), data_block.info,BYTES_TAMANYO);
-					break;
-				case BLOQUE_PRIVKEY_BLOB:
-					//stbuf->st_size = BLOQUE_PRIVKEYBLOB_Get_Tam(data_block);
-					memcpy(&(stbuf->st_size), (data_block.info)+1,BYTES_TAMANYO);
-					break;
-				case BLOQUE_PUBKEY_BLOB:
-					//stbuf->st_size = BLOQUE_PUBKEYBLOB_Get_Tam(data_block);
-					memcpy(&(stbuf->st_size), (data_block.info)+1,BYTES_TAMANYO);
-					break;
-				case BLOQUE_CERT_INTERMEDIO:
-					//stbuf->st_size = BLOQUE_CERTINTERMEDIO_Get_Tam(data_block);
-					memcpy(&(stbuf->st_size), data_block.info,BYTES_TAMANYO);
-					break;
-				case BLOQUE_CERT_OTROS:
-					//stbuf->st_size = BLOQUE_CERTOTROS_Get_Tam(data_block);
-					memcpy(&(stbuf->st_size), data_block.info,BYTES_TAMANYO);
-					break;
-				case BLOQUE_CRYPTO_WALLET:
-					stbuf->st_size = BLOCK_SIZE-16;
-					break;
-				default:
-					stbuf->st_size = 0;
-					break;
-			}			
+			if (strcmp(extension,"cert")){
+				block_number = filemap->cert_block_pos;
+				if (lseek(handle.hDevice, ((block_number+1)*BLOCK_SIZE)+(handle.ib.rzSize*BLOCK_SIZE), SEEK_SET) == -1)
+					return -errno;
+				if (read(handle.hDevice, &data_block, BLOCK_SIZE) == -1)
+					return -errno;
+				memcpy(&(stbuf->st_size), data_block.info,BYTES_TAMANYO);
+			}
+			else if(strcmp(extension,"key")){
+				block_number = filemap->key_block_pos;
+				if (block_number != -1){
+					if (lseek(handle.hDevice, ((block_number+1)*BLOCK_SIZE)+(handle.ib.rzSize*BLOCK_SIZE), SEEK_SET) == -1)
+						return -errno;
+					if (read(handle.hDevice, &data_block, BLOCK_SIZE) == -1)
+						return -errno;
+					CRYPTO_PBE_Descifrar( pwd, handle.ib.id, 20, 1000, 1, CRYPTO_CIPHER_DES_EDE3_CBC, data_block.info, BLOCK_SIZE-8, deciphered_block.info, &tam);
+					memcpy(&(stbuf->st_size), (deciphered_block.info)+1,BYTES_TAMANYO);
+				}	
+			}
+			else
+				return -ENOENT;
 		}
 		else
 			return -ENOENT;
@@ -178,9 +166,13 @@ static int clauer_getattr(const char *path, struct stat *stbuf){
 
 static int clauer_open(const char *path, struct fuse_file_info *fi){
 	file_map_t *filemap;
+	char * name, *extension;
+	
+	name = strtok((char *) path+1,".");
+	extension = strtok(NULL,".");
 
 	//fi->direct_io = 1;
-    HASH_FIND_STR(fm,path+1,filemap);
+    HASH_FIND_STR(fm,name,filemap);
  	if (filemap){
 		if ((fi->flags & O_ACCMODE) != O_RDONLY)
         	return -EACCES;
@@ -192,48 +184,39 @@ static int clauer_open(const char *path, struct fuse_file_info *fi){
 }
 
 static int clauer_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi){
-	block_object_t data_block;
+	block_object_t data_block, deciphered_block;
 	file_map_t *filemap;
 	int block_number;
 	unsigned char *obj;
 	(void) fi;
+	int tam;
+	char * name, *extension;
 	
-	HASH_FIND_STR(fm,path+1,filemap);
+	name = strtok((char *) path+1,".");
+	extension = strtok(NULL,".");
+	
+	HASH_FIND_STR(fm,name,filemap);
  	if (filemap){
-		block_number = filemap->file_block_pos;
-		if (lseek(handle.hDevice, ((block_number+1)*BLOCK_SIZE)+(handle.ib.rzSize*BLOCK_SIZE), SEEK_SET) == -1)
-			return -errno;
-		if (read(handle.hDevice, &data_block, BLOCK_SIZE) == -1)
-			return -errno;
-	
-		switch (data_block.type){
-			case BLOQUE_LLAVE_PRIVADA:
-				obj = BLOQUE_LLAVEPRIVADA_Get_Objeto((unsigned char *) &data_block);
-				break;
-			case BLOQUE_CERT_PROPIO:
-				obj = BLOQUE_CERTPROPIO_Get_Objeto((unsigned char *) &data_block);
-				break;
-			case BLOQUE_CERT_RAIZ:
-				obj = BLOQUE_CERTRAIZ_Get_Objeto((unsigned char *) &data_block);
-				break;
-			case BLOQUE_PRIVKEY_BLOB:
-				obj = BLOQUE_PRIVKEYBLOB_Get_Objeto((unsigned char *) &data_block);
-				break;
-			case BLOQUE_PUBKEY_BLOB:
-				obj = BLOQUE_PUBKEYBLOB_Get_Objeto((unsigned char *) &data_block);
-				break;
-			case BLOQUE_CERT_INTERMEDIO:
-				obj = BLOQUE_CERTINTERMEDIO_Get_Objeto((unsigned char *) &data_block);
-				break;
-			case BLOQUE_CERT_OTROS:
-				obj = BLOQUE_CERTOTROS_Get_Objeto((unsigned char *) &data_block);
-				break;
-			default:
-				return -ENOENT;
-	
+		if (strcmp(extension,"cert")){
+			block_number = filemap->cert_block_pos;
+			if (lseek(handle.hDevice, ((block_number+1)*BLOCK_SIZE)+(handle.ib.rzSize*BLOCK_SIZE), SEEK_SET) == -1)
+				return -errno;
+			if (read(handle.hDevice, &data_block, BLOCK_SIZE) == -1)
+				return -errno;
+			obj = BLOQUE_CERTPROPIO_Get_Objeto((unsigned char *) &data_block);
 		}
+		else if (strcmp(extension,"key")){
+			block_number = filemap->key_block_pos;
+			if (lseek(handle.hDevice, ((block_number+1)*BLOCK_SIZE)+(handle.ib.rzSize*BLOCK_SIZE), SEEK_SET) == -1)
+				return -errno;
+			if (read(handle.hDevice, &data_block, BLOCK_SIZE) == -1)
+				return -errno;
+			CRYPTO_PBE_Descifrar(pwd, handle.ib.id, 20, 1000, 1, CRYPTO_CIPHER_DES_EDE3_CBC, data_block.info, BLOCK_SIZE-8, deciphered_block.info, &tam);
+			obj = BLOQUE_LLAVEPRIVADA_Get_Objeto((unsigned char *) &deciphered_block);
+		}
+		else
+			return -ENOENT;
 		memcpy(buf, obj+offset, size);
-		//strncpy((char *) buf, (char *) (obj+offset), size);
 	}
 	else{
 		return -ENOENT;
@@ -263,9 +246,11 @@ int main(int argc, char *argv[]){
 	handle.ibInit = 1;
 	handle.isFile = 0;
 	
+	CRYPTO_Ini();
 	if ((res = rellenar_hash()) != 0)
 		return res;
     res = fuse_main(argc, argv, &clauer_oper, NULL);
+    CRYPTO_Fin();
     close(handle.hDevice);
     while (fm){
 		current_fm = fm;
