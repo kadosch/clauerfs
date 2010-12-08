@@ -95,7 +95,7 @@ static int clauer_readdir(const char *path, void *buf, fuse_fill_dir_t filler, o
 	(void) offset;
 	(void) fi;
 	file_map_t *filemap;
-	char cert[40], key[40];	
+	char name[40];
     
 	if(strcmp(path, "/") != 0)
     	return -ENOENT;
@@ -104,12 +104,8 @@ static int clauer_readdir(const char *path, void *buf, fuse_fill_dir_t filler, o
 	filler(buf, "..", NULL, 0);
 	
 	for (filemap=fm; filemap!=NULL; filemap=filemap->hh.next){
-		sprintf(cert, "%s.cert", filemap->file_name);
-		filler(buf,cert,NULL,0);
-		if (filemap->key_block_pos != -1){
-			sprintf(key, "%s.key", filemap->file_name);
-			filler(buf,key,NULL,0);
-		}
+		sprintf(name, "%s.p12", filemap->file_name);
+		filler(buf,name,NULL,0);
 	}
 	 
 	return 0;
@@ -117,10 +113,12 @@ static int clauer_readdir(const char *path, void *buf, fuse_fill_dir_t filler, o
 
 
 static int clauer_getattr(const char *path, struct stat *stbuf){
-	block_object_t data_block, deciphered_block;
+	block_object_t cert_block, key_block, deciphered_block;
 	file_map_t *filemap;
-	int res = 0, block_number, tam;
+	int res = 0, cert_block_number, key_block_number, key_size;
+	unsigned long cert_size, p12_size;
 	char * name, *extension;
+	unsigned char *obj_cert, *obj_key;
 	
 	name = strtok((char *) path+1,".");
 	extension = strtok(NULL,".");
@@ -135,24 +133,26 @@ static int clauer_getattr(const char *path, struct stat *stbuf){
  		if (filemap){
 			stbuf->st_mode = S_IFREG | 0444;
 			stbuf->st_nlink = 1;
-			if (strcmp(extension,"cert")){
-				block_number = filemap->cert_block_pos;
-				if (lseek(handle.hDevice, ((block_number+1)*BLOCK_SIZE)+(handle.ib.rzSize*BLOCK_SIZE), SEEK_SET) == -1)
+			cert_block_number = filemap->cert_block_pos;
+			key_block_number = filemap->key_block_pos;
+			if (lseek(handle.hDevice, ((cert_block_number+1)*BLOCK_SIZE)+(handle.ib.rzSize*BLOCK_SIZE), SEEK_SET) == -1)
+				return -errno;
+			if (read(handle.hDevice, &cert_block, BLOCK_SIZE) == -1)
+				return -errno;
+			cert_size = BLOQUE_CERTPROPIO_Get_Tam((unsigned char *) &cert_block);
+			if (key_block_number != -1){
+				if (lseek(handle.hDevice, ((key_block_number+1)*BLOCK_SIZE)+(handle.ib.rzSize*BLOCK_SIZE), SEEK_SET) == -1)
 					return -errno;
-				if (read(handle.hDevice, &data_block, BLOCK_SIZE) == -1)
+				if (read(handle.hDevice, &key_block, BLOCK_SIZE) == -1)
 					return -errno;
-				memcpy(&(stbuf->st_size), data_block.info,BYTES_TAMANYO);
-			}
-			else if(strcmp(extension,"key")){
-				block_number = filemap->key_block_pos;
-				if (block_number != -1){
-					if (lseek(handle.hDevice, ((block_number+1)*BLOCK_SIZE)+(handle.ib.rzSize*BLOCK_SIZE), SEEK_SET) == -1)
-						return -errno;
-					if (read(handle.hDevice, &data_block, BLOCK_SIZE) == -1)
-						return -errno;
-					CRYPTO_PBE_Descifrar( pwd, handle.ib.id, 20, 1000, 1, CRYPTO_CIPHER_DES_EDE3_CBC, data_block.info, BLOCK_SIZE-8, deciphered_block.info, &tam);
-					memcpy(&(stbuf->st_size), (deciphered_block.info)+1,BYTES_TAMANYO);
-				}	
+				CRYPTO_PBE_Descifrar( pwd, handle.ib.id, 20, 1000, 1, CRYPTO_CIPHER_DES_EDE3_CBC, key_block.info, BLOCK_SIZE-8, deciphered_block.info, &key_size);
+				key_size = BLOQUE_LLAVEPRIVADA_Get_Tam((unsigned char *) &deciphered_block);
+				obj_cert = BLOQUE_CERTPROPIO_Get_Objeto((unsigned char *) &cert_block);
+				obj_key = BLOQUE_LLAVEPRIVADA_Get_Objeto((unsigned char *) &deciphered_block);
+				if (CRYPTO_PKCS12_Crear(obj_key, key_size, NULL, obj_cert, cert_size, NULL, NULL, 0, pwd, name, NULL, &p12_size) == 0)
+					stbuf->st_size = p12_size;
+				else
+					return -ENOENT;
 			}
 			else
 				return -ENOENT;
@@ -184,39 +184,47 @@ static int clauer_open(const char *path, struct fuse_file_info *fi){
 }
 
 static int clauer_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi){
-	block_object_t data_block, deciphered_block;
+	block_object_t cert_block, key_block, deciphered_block;
 	file_map_t *filemap;
-	int block_number;
-	unsigned char *obj;
+	int cert_block_number, key_block_number, key_size;
+	unsigned long cert_size, p12_size;
+	unsigned char *obj_cert, *obj_key, *p12;
 	(void) fi;
-	int tam;
-	char * name, *extension;
+	char *name, *extension;
+
 	
 	name = strtok((char *) path+1,".");
 	extension = strtok(NULL,".");
 	
 	HASH_FIND_STR(fm,name,filemap);
  	if (filemap){
-		if (strcmp(extension,"cert")){
-			block_number = filemap->cert_block_pos;
-			if (lseek(handle.hDevice, ((block_number+1)*BLOCK_SIZE)+(handle.ib.rzSize*BLOCK_SIZE), SEEK_SET) == -1)
+ 		cert_block_number = filemap->cert_block_pos;
+		key_block_number = filemap->key_block_pos;
+		if (lseek(handle.hDevice, ((cert_block_number+1)*BLOCK_SIZE)+(handle.ib.rzSize*BLOCK_SIZE), SEEK_SET) == -1)
+			return -errno;
+		if (read(handle.hDevice, &cert_block, BLOCK_SIZE) == -1)
+			return -errno;
+		cert_size = BLOQUE_CERTPROPIO_Get_Tam((unsigned char *) &cert_block);
+		if (key_block_number != -1){
+			if (lseek(handle.hDevice, ((key_block_number+1)*BLOCK_SIZE)+(handle.ib.rzSize*BLOCK_SIZE), SEEK_SET) == -1)
 				return -errno;
-			if (read(handle.hDevice, &data_block, BLOCK_SIZE) == -1)
+			if (read(handle.hDevice, &key_block, BLOCK_SIZE) == -1)
 				return -errno;
-			obj = BLOQUE_CERTPROPIO_Get_Objeto((unsigned char *) &data_block);
-		}
-		else if (strcmp(extension,"key")){
-			block_number = filemap->key_block_pos;
-			if (lseek(handle.hDevice, ((block_number+1)*BLOCK_SIZE)+(handle.ib.rzSize*BLOCK_SIZE), SEEK_SET) == -1)
-				return -errno;
-			if (read(handle.hDevice, &data_block, BLOCK_SIZE) == -1)
-				return -errno;
-			CRYPTO_PBE_Descifrar(pwd, handle.ib.id, 20, 1000, 1, CRYPTO_CIPHER_DES_EDE3_CBC, data_block.info, BLOCK_SIZE-8, deciphered_block.info, &tam);
-			obj = BLOQUE_LLAVEPRIVADA_Get_Objeto((unsigned char *) &deciphered_block);
+			CRYPTO_PBE_Descifrar( pwd, handle.ib.id, 20, 1000, 1, CRYPTO_CIPHER_DES_EDE3_CBC, key_block.info, BLOCK_SIZE-8, deciphered_block.info, &key_size);
+			key_size = BLOQUE_LLAVEPRIVADA_Get_Tam((unsigned char *) &deciphered_block);
+			obj_cert = BLOQUE_CERTPROPIO_Get_Objeto((unsigned char *) &cert_block);
+			obj_key = BLOQUE_LLAVEPRIVADA_Get_Objeto((unsigned char *) &deciphered_block);
+			p12 = ( unsigned char * ) malloc(size);
+			if (CRYPTO_PKCS12_Crear(obj_key, key_size, NULL, obj_cert, cert_size, NULL, NULL, 0, pwd, name, p12, &p12_size) == 0){
+				memcpy(buf, p12+offset, size);
+				free(p12);
+			}
+			else
+				return -ENOENT;
 		}
 		else
 			return -ENOENT;
-		memcpy(buf, obj+offset, size);
+
 	}
 	else{
 		return -ENOENT;
